@@ -256,3 +256,9 @@ def delete_task(task_id: int, current_user: dict = Depends(get_current_user)):
     conn.commit()
     conn.close()
     return None
+
+# For Render to make sure backend is okay
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
