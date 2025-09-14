@@ -1,177 +1,223 @@
-from fastapi import FastAPI, HTTPException, Depends
+# Standard library imports
+import os
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# Third-party imports
+from dotenv import load_dotenv
+import jwt
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
-from typing import Literal
 from passlib.context import CryptContext
-import sqlite3
-from datetime import datetime, timezone, timedelta
-import jwt
-import os
-from dotenv import load_dotenv
+from supabase import create_client, Client
+
+# Optional: type hints
+from typing import Literal, Optional, Dict
+
+
+# ----- LOAD ENVIRONMENT VARIABLES -----
+env_path = Path("./env.env")
+if not env_path.is_file():
+    raise FileNotFoundError(f"Environment file not found: {env_path}")
+load_dotenv(env_path)
+
 
 # ----- CONFIG -----
-load_dotenv("./env.env")
 SECRET_KEY = os.getenv("SECRET_KEY")
 if not SECRET_KEY:
-    raise ValueError("No SECRET_KEY found! Set it in env.env")
+    raise ValueError("Missing environment variable: SECRET_KEY")
 
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 15
+ACCESS_TOKEN_EXPIRE = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)  # for direct use
+
 
 # ----- INIT APP -----
 app = FastAPI(title="To-Do List API with Multi-User JWT Auth")
 
+
 # ----- PASSWORD HASHING -----
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")  # bcrypt recommended
 
-# ----- DATABASE -----
-def get_connection():
-    conn = sqlite3.connect("tasks.db")
-    conn.row_factory = sqlite3.Row
-    return conn
 
-def init_db():
-    conn = get_connection()
-    cursor = conn.cursor()
-    # Users table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL
-        )
-    """)
-    # Tasks table
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            description TEXT,
-            priority INTEGER NOT NULL,
-            status TEXT CHECK(status IN ('done','pending')) NOT NULL,
-            created_on TEXT NOT NULL,
-            last_modified TEXT NOT NULL,
-            user_id INTEGER NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-    """)
-    conn.commit()
-    conn.close()
+# ----- DATABASE CLIENT -----
+def get_client() -> Client:
+    """Initialize and return a Supabase client."""
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_KEY")
+    if not url or not key:
+        raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in environment")
+    return create_client(url, key)
 
-init_db()
 
-# ----- MODELS -----
+# Singleton-style client
+supabase = get_client()
+
+
+# ----- CONSTANTS -----
+TASK_STATUS = Literal["done", "pending"]  # reuse for all task models
+
+
+# ----- USER MODELS -----
 class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     password: str = Field(..., min_length=6)
 
+
 class Token(BaseModel):
     access_token: str
-    token_type: str
+    token_type: str = "bearer"
 
-class TaskCreate(BaseModel):
+
+# ----- TASK MODELS -----
+class TaskBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    description: str | None = Field(None, max_length=500)
+    description: Optional[str] = Field(None, max_length=500)
     priority: int = Field(..., ge=1)
-    status: Literal["done", "pending"]
+    status: TASK_STATUS
 
-class TaskRead(TaskCreate):
+
+class TaskCreate(TaskBase):
+    pass  # inherits all fields from TaskBase
+
+
+class TaskRead(TaskBase):
     id: int
     created_on: datetime
     last_modified: datetime
 
+
 class TaskUpdate(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
-    description: str | None = Field(None, max_length=500)
+    description: str = Field(..., max_length=500)
     priority: int = Field(..., ge=1)
-    status: Literal["done", "pending"]
+    status: TASK_STATUS
 
+
+# ----- SECURITY -----
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
-# ----- AUTH UTILS -----
-def verify_password(plain_password, hashed_password):
+
+# ----- PASSWORD UTILS -----
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a plaintext password against the hashed password."""
     return pwd_context.verify(plain_password, hashed_password)
 
-def get_password_hash(password):
+
+def get_password_hash(password: str) -> str:
+    """Hash a plaintext password."""
     return pwd_context.hash(password)
 
-def create_access_token(data: dict, expires_delta: timedelta | None = None):
+
+# ----- JWT UTILS -----
+def create_access_token(data: Dict[str, str], expires_delta: Optional[timedelta] = None) -> str:
+    """Create a JWT token with an optional expiry."""
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    expire = datetime.utcnow().replace(tzinfo=timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_current_user(token: str = Depends(oauth2_scheme)):
+
+def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    """Retrieve the current user based on JWT token."""
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
+        username: str = payload.get("sub")
+        if not username:
+            raise HTTPException(status_code=401, detail="Invalid token: missing subject")
     except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
+        raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
-    user = cursor.fetchone()
-    conn.close()
+    # Fetch user from Supabase
+    response = supabase.table("users").select("*").eq("username", username).execute()
+    user = response.data[0] if response.data else None
+    
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    
     return user
 
+
 # ----- USER ROUTES -----
-@app.post("/register", status_code=201)
-def register(user: UserCreate):
-    conn = get_connection()
-    cursor = conn.cursor()
+@app.post("/register", status_code=status.HTTP_201_CREATED)
+def register(user: UserCreate) -> dict:
+    """Register a new user with hashed password."""
     hashed_pw = get_password_hash(user.password)
+
+    # Check if username already exists
+    existing_user = supabase.table("users").select("username").eq("username", user.username).execute()
+    if existing_user.data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Username already exists")
+
     try:
-        cursor.execute(
-            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-            (user.username, hashed_pw)
-        )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Username already exists")
-    conn.close()
-    return {"msg": "User created successfully"}
+        response = supabase.table("users").insert({
+            "username": user.username,
+            "password_hash": hashed_pw
+        }).execute()
+
+        # If insertion failed for any reason
+        if not response.data:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail="Failed to create user")
+
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"Registration failed: {str(e)}")
+
+    return {"msg": "User created successfully", "username": user.username}
+
 
 @app.post("/token", response_model=Token)
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM users WHERE username = ?", (form_data.username,))
-    user = cursor.fetchone()
-    conn.close()
+def login(form_data: OAuth2PasswordRequestForm = Depends()) -> Token:
+    """
+    Authenticate user and return JWT access token.
+    """
+    try:
+        # Query Supabase for the user
+        response = supabase.table("users").select("*").eq("username", form_data.username).execute()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail=f"Login failed: {str(e)}")
+
+    user = response.data[0] if response.data else None
+
     if not user or not verify_password(form_data.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+
+    # Create JWT token
     access_token = create_access_token({"sub": user["username"]})
-    return {"access_token": access_token, "token_type": "bearer"}
+
+    return Token(access_token=access_token, token_type="bearer")
+
 
 # ----- TASK ROUTES -----
 @app.post("/tasks", response_model=TaskRead, status_code=201)
 def create_task(task: TaskCreate, current_user: dict = Depends(get_current_user)):
     now = datetime.now(timezone.utc).isoformat()
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO tasks (name, description, priority, status, created_on, last_modified, user_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (task.name.strip(), task.description, task.priority, task.status, now, now, current_user["id"]),
-    )
-    conn.commit()
-    task_id = cursor.lastrowid
-    cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return dict(row)
 
-from typing import Optional
+    response = supabase.table("tasks").insert({
+        "name": task.name.strip(),
+        "description": task.description,
+        "priority": task.priority,
+        "status": task.status,
+        "created_on": now,
+        "last_modified": now,
+        "user_id": current_user["id"]
+    }).execute()
+
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Task creation failed")
+
+    # Supabase returns the inserted row(s) in response.data
+    return response.data[0]
+
 
 @app.get("/tasks", response_model=list[TaskRead])
 def get_tasks(
@@ -180,85 +226,117 @@ def get_tasks(
     status: Optional[str] = None,
     current_user: dict = Depends(get_current_user),
 ):
-    # Validate inputs to prevent SQL injection
+    # Validate inputs
     allowed_sort_cols = {"priority", "created_on", "last_modified"}
     if sort_by not in allowed_sort_cols:
         sort_by = "priority"
 
     order = order.lower()
-    if order not in ("asc", "desc"):
-        order = "desc"
+    desc = True if order == "desc" else False
 
-    conn = get_connection()
-    cursor = conn.cursor()
+    # Build query
+    query = supabase.table("tasks").select("*").eq("user_id", current_user["id"])
 
-    # Base query
-    sql = "SELECT * FROM tasks WHERE user_id = ?"
-    params = [current_user["id"]]
-
-    # Optional filter
     if status in ("done", "pending"):
-        sql += " AND status = ?"
-        params.append(status)
+        query = query.eq("status", status)
 
-    # Sorting
-    sql += f" ORDER BY {sort_by} {order.upper()}"
+    query = query.order(sort_by, desc=desc)
 
-    cursor.execute(sql, params)
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(row) for row in rows]
+    response = query.execute()
+
+    if not response.data:
+        return []
+
+    return response.data
+
 
 
 @app.get("/tasks/{task_id}", response_model=TaskRead)
 def get_task(task_id: int, current_user: dict = Depends(get_current_user)):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM tasks WHERE id = ? AND user_id = ?", (task_id, current_user["id"]))
-    row = cursor.fetchone()
-    conn.close()
-    if not row:
+    response = (
+        supabase.table("tasks")
+        .select("*")
+        .eq("id", task_id)
+        .eq("user_id", current_user["id"])
+        .execute()
+    )
+
+    task = response.data[0] if response.data else None
+
+    if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return dict(row)
+
+    return task
+
 
 @app.patch("/tasks/{task_id}", response_model=TaskRead)
 def update_task(task_id: int, body: TaskUpdate, current_user: dict = Depends(get_current_user)):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM tasks WHERE id = ? AND user_id = ?", (task_id, current_user["id"]))
-    if not cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Task not found")
-    now = datetime.now(timezone.utc).isoformat()
-    cursor.execute(
-        """
-        UPDATE tasks
-        SET name = ?, description = ?, priority = ?, status = ?, last_modified = ?
-        WHERE id = ? AND user_id = ?
-        """,
-        (body.name, body.description, body.priority, body.status, now, task_id, current_user["id"]),
+    # Check if the task exists for this user
+    exists = (
+        supabase.table("tasks")
+        .select("id")
+        .eq("id", task_id)
+        .eq("user_id", current_user["id"])
+        .execute()
     )
-    conn.commit()
-    cursor.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
-    row = cursor.fetchone()
-    conn.close()
-    return dict(row)
+
+    if not exists.data:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    # Perform the update
+    response = (
+        supabase.table("tasks")
+        .update({
+            "name": body.name,
+            "description": body.description,
+            "priority": body.priority,
+            "status": body.status,
+            "last_modified": now,
+        })
+        .eq("id", task_id)
+        .eq("user_id", current_user["id"])
+        .execute()
+    )
+
+    if not response.data:
+        raise HTTPException(status_code=500, detail="Update failed")
+
+    return response.data[0]
+
+
+from postgrest.exceptions import APIError
 
 @app.delete("/tasks/{task_id}", status_code=204)
 def delete_task(task_id: int, current_user: dict = Depends(get_current_user)):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM tasks WHERE id = ? AND user_id = ?", (task_id, current_user["id"]))
-    if not cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Task not found")
-    cursor.execute("DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, current_user["id"]))
-    conn.commit()
-    conn.close()
+    try:
+        # Check existence
+        exists = (
+            supabase.table("tasks")
+            .select("id")
+            .eq("id", task_id)
+            .eq("user_id", current_user["id"])
+            .execute()
+        )
+
+        if not exists.data:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+        # Delete
+        supabase.table("tasks") \
+            .delete() \
+            .eq("id", task_id) \
+            .eq("user_id", current_user["id"]) \
+            .execute()
+
+    except APIError as e:
+        raise HTTPException(status_code=500, detail=f"Supabase error: {e}")
+
     return None
 
-# For Render to make sure backend is okay
 
+# For Render to make sure backend is okay
 @app.get("/health")
 def health():
     return {"status": "ok"}
