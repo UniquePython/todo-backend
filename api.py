@@ -324,11 +324,7 @@ def delete_task(task_id: int, current_user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=404, detail="Task not found")
 
         # Delete
-        supabase.table("tasks") \
-            .delete() \
-            .eq("id", task_id) \
-            .eq("user_id", current_user["id"]) \
-            .execute()
+        supabase.table("tasks").delete().eq("id", task_id).eq("user_id", current_user["id"]).execute()
 
     except APIError as e:
         raise HTTPException(status_code=500, detail=f"Supabase error: {e}")
